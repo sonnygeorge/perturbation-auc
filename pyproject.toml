@@ -1,0 +1,35 @@
+[project]
+name = "perturbation-auc"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "sonnygeorge", email = "sonnygeorge5@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "litellm>=1.83.9",
+]
+
+[dependency-groups]
+dev = ["black>=24", "ruff>=0.9"]
+
+[project.scripts]
+perturbation-auc = "perturbation_auc:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.black]
+line-length = 105
+
+[tool.ruff]
+line-length = 105
+target-version = "py312"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["perturbation_auc"]
