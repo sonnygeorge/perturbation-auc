@@ -1,12 +1,12 @@
 import random
 import string
-from collections.abc import Callable
 
 from perturbation_auc.perturbation_auc import PerturbationAUC
 from perturbation_auc.schema import (
     EvalJob,
     InstructionToRolloutResults,
     MutatedInstruction,
+    MutationOperator,
     PerturbationAUCHyperParams,
     RolloutResult,
 )
@@ -125,19 +125,24 @@ def mock_eval_runner(eval_job: EvalJob) -> InstructionToRolloutResults:
     return instruction_to_rollout_results
 
 
-async def mock_mutation_operator(sample_parents: Callable[[int], list[str]]) -> list[MutatedInstruction]:
-    """Add random character somewhere in the sampled parent instruction."""
-    parent_inst = sample_parents(1)[0]
-    idx = random.randint(0, len(parent_inst) - 1)
-    mutated_inst_text = parent_inst[:idx] + random.choice(string.ascii_letters) + parent_inst[idx + 1 :]
-    return [MutatedInstruction(text=mutated_inst_text, parents=[parent_inst])]
+class MockMutationOperator(MutationOperator):
+    """Add a random character somewhere in the sampled parent instruction."""
+
+    n_parents_needed = 1
+
+    async def run(self, parents: list[str]) -> list[MutatedInstruction]:
+        parent_inst = parents[0]
+        idx = random.randint(0, len(parent_inst) - 1)
+        char = random.choice(string.ascii_letters)
+        mutated_inst_text = parent_inst[:idx] + char + parent_inst[idx + 1 :]
+        return [MutatedInstruction(text=mutated_inst_text, parents=parents)]
 
 
 if __name__ == "__main__":
     perturbation_auc = PerturbationAUC(
         instruction=LIBERO_TASK_INSTRUCTIONS[0],
         eval_runner=mock_eval_runner,
-        mutation_operators=[mock_mutation_operator],
+        mutation_operators=[MockMutationOperator()],
         hyper_params=PerturbationAUCHyperParams(
             n_generations=4,
             n_offspring_per_generation=3,

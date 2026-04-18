@@ -2,10 +2,9 @@ import asyncio
 import itertools
 import random
 from collections.abc import Iterator, Sequence
-from functools import partial
 from statistics import mean
 
-from perturbation_auc.mutation_operators import generic_llm_mutation, llm_crossover_mutation
+from perturbation_auc.mutation_operators import GenericLLMMutation, LLMCrossoverMutation
 from perturbation_auc.schema import (
     EvalJob,
     EvalRunner,
@@ -24,9 +23,9 @@ MAX_MUTATION_OPERATION_BATCH_ATTEMPTS = 1000
 
 
 def _default_mutation_operators_and_sampling_weights() -> tuple[list[MutationOperator], list[float]]:
-    default_mutation_operators = [
-        partial(generic_llm_mutation, model="gpt-5.4-nano", temperature=0.9),
-        partial(llm_crossover_mutation, model="gpt-5.4-nano", temperature=0.9),
+    default_mutation_operators: list[MutationOperator] = [
+        GenericLLMMutation(model="gpt-5.4-nano", temperature=0.9),
+        LLMCrossoverMutation(model="gpt-5.4-nano", temperature=0.9),
     ]
     return default_mutation_operators, [0.7, 0.3]
 
@@ -63,23 +62,55 @@ class PerturbationAUC:
                 f"({len(mutation_operators)} != {len(mutation_operator_sampling_weights)})"
             )
             raise ValueError(msg)
+        for i, op in enumerate(mutation_operators):
+            if not isinstance(op, MutationOperator):
+                msg = f"mutation_operators[{i}] must be an instance of ABC {MutationOperator.__name__}"
+                raise TypeError(msg)
+            if op.n_parents_needed < 1:
+                msg = (
+                    f"mutation_operators[{i}] ({type(op).__name__}) has n_parents_needed="
+                    f"{op.n_parents_needed}; must be >= 1"
+                )
+                raise ValueError(msg)
+        if not any(op.n_parents_needed == 1 for op in mutation_operators):
+            msg = (
+                "At least one mutation operator with n_parents_needed=1 is required to bootstrap "
+                "the first generation (whose only available parent is the initial instruction)"
+            )
+            raise ValueError(msg)
         self.mutation_operators = list(mutation_operators)
         self.mutation_operator_sampling_weights = list(mutation_operator_sampling_weights)
         self._seen_instructions: dict[str, MutatedInstruction | None] = {self.instruction: None}
 
     async def _get_mutated_instructions(self, survivors: list[str]) -> list[MutatedInstruction]:
         """Get the next generation of mutated instructions offspring."""
-        sample_parents = lambda n: random.sample(survivors, n)  # noqa: E731
-        mutated_instructions = []
+        # Filter to operators whose parent requirement can be satisfied by the current survivor pool
+        n_available = len(survivors)
+        eligible: list[tuple[MutationOperator, float]] = [
+            (op, w)
+            for op, w in zip(self.mutation_operators, self.mutation_operator_sampling_weights)
+            if op.n_parents_needed <= n_available
+        ]
+        if not eligible:
+            min_needed = min(op.n_parents_needed for op in self.mutation_operators)
+            msg = (
+                f"No mutation operator can run with {n_available} survivor(s); the lowest "
+                f"n_parents_needed across configured operators is {min_needed}"
+            )
+            raise RuntimeError(msg)
+        eligible_operators, eligible_weights = (list(t) for t in zip(*eligible))
+        mutated_instructions: list[MutatedInstruction] = []
         # Apply mutation operators in concurrent batches
         for _ in range(MAX_MUTATION_OPERATION_BATCH_ATTEMPTS):
             operators = random.choices(
-                self.mutation_operators,
-                weights=self.mutation_operator_sampling_weights,
+                eligible_operators,
+                weights=eligible_weights,
                 k=N_MUTATION_OPERATORS_TO_RUN_CONCURRENTLY,
             )
             mutated_instructions_batch = itertools.chain.from_iterable(
-                await asyncio.gather(*[operator(sample_parents) for operator in operators])
+                await asyncio.gather(
+                    *[op.run(random.sample(survivors, op.n_parents_needed)) for op in operators]
+                )
             )
             # Filter out instructions that have already been seen
             novel_instructions = [

@@ -1,4 +1,5 @@
-from collections.abc import Callable, Mapping
+from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeAlias
 
@@ -38,8 +39,11 @@ class MutatedInstruction:
     extras: Mapping[str, Any] | None = None
 
 
-class MutationOperator(Protocol):
-    async def __call__(self, sample_parents: Callable[[int], list[str]]) -> list[MutatedInstruction]: ...
+class MutationOperator(ABC):
+    n_parents_needed: int = 1
+
+    @abstractmethod
+    async def run(self, parents: list[str]) -> list[MutatedInstruction]: ...
 
 
 @dataclass

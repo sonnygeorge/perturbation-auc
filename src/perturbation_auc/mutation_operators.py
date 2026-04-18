@@ -1,29 +1,35 @@
-from collections.abc import Callable
+from typing import Any
 
 from litellm import acompletion
 
-from perturbation_auc.schema import MutatedInstruction
+from perturbation_auc.schema import MutatedInstruction, MutationOperator
 
 
-# Implements schema.MutationOperator protocol when partialized
-async def generic_llm_mutation(
-    sample_parents: Callable[[int], list[str]], model: str = "gpt-5.4-nano", **completion_kwargs
-) -> list[MutatedInstruction]:
-    parent_instruction = sample_parents(1)[0]
-    prompt = f'Mutate this: "{parent_instruction}"'  # FIXME
-    messages = [{"role": "user", "content": prompt}]
-    response = await acompletion(model=model, messages=messages, **completion_kwargs)
-    mutated_instruction_text = response.choices[0].message.content  # FIXME
-    return [MutatedInstruction(text=mutated_instruction_text, parents=[parent_instruction])]
+class GenericLLMMutation(MutationOperator):
+    n_parents_needed = 1
+
+    def __init__(self, model: str = "gpt-5.4-nano", **completion_kwargs: Any) -> None:
+        self.model = model
+        self.completion_kwargs = completion_kwargs
+
+    async def run(self, parents: list[str]) -> list[MutatedInstruction]:
+        prompt = f'Mutate this: "{parents[0]}"'  # FIXME
+        messages = [{"role": "user", "content": prompt}]
+        response = await acompletion(model=self.model, messages=messages, **self.completion_kwargs)
+        mutated_instruction_text = response.choices[0].message.content  # FIXME
+        return [MutatedInstruction(text=mutated_instruction_text, parents=parents)]
 
 
-# Implements schema.MutationOperator protocol when partialized
-async def llm_crossover_mutation(
-    sample_parents: Callable[[int], list[str]], model: str = "gpt-5.4-nano", **completion_kwargs
-) -> list[MutatedInstruction]:
-    parent_instructions = sample_parents(2)
-    prompt = f'Combine these: "{parent_instructions[0]}" and "{parent_instructions[1]}"'  # FIXME
-    messages = [{"role": "user", "content": prompt}]
-    response = await acompletion(model=model, messages=messages, **completion_kwargs)
-    mutated_instruction_text = response.choices[0].message.content  # FIXME
-    return [MutatedInstruction(text=mutated_instruction_text, parents=parent_instructions)]
+class LLMCrossoverMutation(MutationOperator):
+    n_parents_needed = 2
+
+    def __init__(self, model: str = "gpt-5.4-nano", **completion_kwargs: Any) -> None:
+        self.model = model
+        self.completion_kwargs = completion_kwargs
+
+    async def run(self, parents: list[str]) -> list[MutatedInstruction]:
+        prompt = f'Combine these: "{parents[0]}" and "{parents[1]}"'  # FIXME
+        messages = [{"role": "user", "content": prompt}]
+        response = await acompletion(model=self.model, messages=messages, **self.completion_kwargs)
+        mutated_instruction_text = response.choices[0].message.content  # FIXME
+        return [MutatedInstruction(text=mutated_instruction_text, parents=parents)]
