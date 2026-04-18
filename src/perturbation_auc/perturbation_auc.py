@@ -1,7 +1,7 @@
 import asyncio
 import itertools
 import random
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Sequence
 from statistics import mean
 
 from perturbation_auc.mutation_operators import GenericLLMMutation, LLMCrossoverMutation
@@ -15,11 +15,8 @@ from perturbation_auc.schema import (
     MutationOperator,
     PerturbationAUCHyperParams,
     PerturbationAUCResult,
+    PerturbationAUCRuntimeOptions,
 )
-
-# TODO: Move to params/config
-N_MUTATION_OPERATORS_TO_RUN_CONCURRENTLY = 1
-MAX_MUTATION_OPERATION_BATCH_ATTEMPTS = 1000
 
 
 def _default_mutation_operators_and_sampling_weights() -> tuple[list[MutationOperator], list[float]]:
@@ -30,59 +27,75 @@ def _default_mutation_operators_and_sampling_weights() -> tuple[list[MutationOpe
     return default_mutation_operators, [0.7, 0.3]
 
 
+def _validate_mutation_operators(
+    mutation_operators: Sequence[MutationOperator] | None,
+    mutation_operator_sampling_weights: Sequence[float] | None,
+) -> tuple[list[MutationOperator], list[float]]:
+    """Resolve defaults and validate the mutation operator config, returning normalized lists."""
+    if mutation_operators is None:
+        if mutation_operator_sampling_weights is not None:
+            msg = "mutation_operator_sampling_weights was provided without mutation_operators"
+            raise ValueError(msg)
+        mutation_operators, mutation_operator_sampling_weights = (
+            _default_mutation_operators_and_sampling_weights()
+        )
+    elif mutation_operator_sampling_weights is None:
+        mutation_operator_sampling_weights = [1.0] * len(mutation_operators)
+    if len(mutation_operators) == 0:
+        msg = "mutation_operators must be non-empty"
+        raise ValueError(msg)
+    if len(mutation_operators) != len(mutation_operator_sampling_weights):
+        msg = (
+            "mutation_operators and mutation_operator_sampling_weights must have the same length "
+            f"({len(mutation_operators)} != {len(mutation_operator_sampling_weights)})"
+        )
+        raise ValueError(msg)
+    for i, op in enumerate(mutation_operators):
+        if not isinstance(op, MutationOperator):
+            msg = f"mutation_operators[{i}] must be an instance of ABC {MutationOperator.__name__}"
+            raise TypeError(msg)
+        if op.n_parents_needed < 1:
+            msg = (
+                f"mutation_operators[{i}] ({type(op).__name__}) has n_parents_needed="
+                f"{op.n_parents_needed}; must be >= 1"
+            )
+            raise ValueError(msg)
+    if not any(op.n_parents_needed == 1 for op in mutation_operators):
+        msg = (
+            "At least one mutation operator with n_parents_needed=1 is required to bootstrap "
+            "the first generation (whose only available parent is the initial instruction)"
+        )
+        raise ValueError(msg)
+    return list(mutation_operators), list(mutation_operator_sampling_weights)
+
+
 class PerturbationAUC:
     def __init__(
         self,
         instruction: str,
         eval_runner: EvalRunner,
-        hyper_params: PerturbationAUCHyperParams | None = None,
+        hyper_params: PerturbationAUCHyperParams = PerturbationAUCHyperParams(),
+        runtime_options: PerturbationAUCRuntimeOptions = PerturbationAUCRuntimeOptions(),
         mutation_operators: Sequence[MutationOperator] | None = None,
         mutation_operator_sampling_weights: Sequence[float] | None = None,
     ) -> None:
         self.instruction = instruction
         self.eval_runner = eval_runner
-        self.hparams = hyper_params if hyper_params is not None else PerturbationAUCHyperParams()
-        if self.hparams.seed is not None:
-            random.seed(self.hparams.seed)
-        if mutation_operators is None:
-            if mutation_operator_sampling_weights is not None:
-                msg = "mutation_operator_sampling_weights was provided without mutation_operators"
-                raise ValueError(msg)
-            mutation_operators, mutation_operator_sampling_weights = (
-                _default_mutation_operators_and_sampling_weights()
-            )
-        elif mutation_operator_sampling_weights is None:
-            mutation_operator_sampling_weights = [1.0] * len(mutation_operators)
-        if len(mutation_operators) == 0:
-            msg = "mutation_operators must be non-empty"
-            raise ValueError(msg)
-        if len(mutation_operators) != len(mutation_operator_sampling_weights):
-            msg = (
-                "mutation_operators and mutation_operator_sampling_weights must have the same length "
-                f"({len(mutation_operators)} != {len(mutation_operator_sampling_weights)})"
-            )
-            raise ValueError(msg)
-        for i, op in enumerate(mutation_operators):
-            if not isinstance(op, MutationOperator):
-                msg = f"mutation_operators[{i}] must be an instance of ABC {MutationOperator.__name__}"
-                raise TypeError(msg)
-            if op.n_parents_needed < 1:
-                msg = (
-                    f"mutation_operators[{i}] ({type(op).__name__}) has n_parents_needed="
-                    f"{op.n_parents_needed}; must be >= 1"
-                )
-                raise ValueError(msg)
-        if not any(op.n_parents_needed == 1 for op in mutation_operators):
-            msg = (
-                "At least one mutation operator with n_parents_needed=1 is required to bootstrap "
-                "the first generation (whose only available parent is the initial instruction)"
-            )
-            raise ValueError(msg)
-        self.mutation_operators = list(mutation_operators)
-        self.mutation_operator_sampling_weights = list(mutation_operator_sampling_weights)
+        self.hparams = hyper_params
+        self.runtime_options = runtime_options
+        self._rng = random.Random(self.hparams.seed)  # Rng managed at instance level
+        self.mutation_operators, self.mutation_operator_sampling_weights = _validate_mutation_operators(
+            mutation_operators, mutation_operator_sampling_weights
+        )
         self._seen_instructions: dict[str, MutatedInstruction | None] = {self.instruction: None}
 
-    async def _get_mutated_instructions(self, survivors: list[str]) -> list[MutatedInstruction]:
+    def _next_derived_seed(self) -> int | None:
+        """Draw a fresh seed from instance-level RNG."""
+        if self.hparams.seed is None:
+            return None
+        return self._rng.randint(0, 2**31 - 1)
+
+    async def _get_mutated_offspring(self, survivors: list[str]) -> list[MutatedInstruction]:
         """Get the next generation of mutated instructions offspring."""
         # Filter to operators whose parent requirement can be satisfied by the current survivor pool
         n_available = len(survivors)
@@ -99,56 +112,70 @@ class PerturbationAUC:
             )
             raise RuntimeError(msg)
         eligible_operators, eligible_weights = (list(t) for t in zip(*eligible))
-        mutated_instructions: list[MutatedInstruction] = []
+        mutated_instructions: dict[str, MutatedInstruction] = {}
         # Apply mutation operators in concurrent batches
-        for _ in range(MAX_MUTATION_OPERATION_BATCH_ATTEMPTS):
-            operators = random.choices(
+        for _ in range(self.runtime_options.max_mutation_operator_batch_attempts):
+            # Sample operators for this batch
+            operators: list[MutationOperator] = self._rng.choices(
                 eligible_operators,
                 weights=eligible_weights,
-                k=N_MUTATION_OPERATORS_TO_RUN_CONCURRENTLY,
+                k=self.runtime_options.mutation_operator_batch_size,
             )
-            mutated_instructions_batch = itertools.chain.from_iterable(
+            # Run batch and flatten mutated instructions into a single list. Derive a fresh
+            # per-call seed for each operator invocation so concurrent operators don't share
+            # seeds and so successive batches see distinct seeds.
+            mutated_instructions_from_batch = itertools.chain.from_iterable(
                 await asyncio.gather(
-                    *[op.run(random.sample(survivors, op.n_parents_needed)) for op in operators]
+                    *[
+                        op.run(
+                            tuple(self._rng.sample(survivors, op.n_parents_needed)),
+                            seed=self._next_derived_seed(),
+                        )
+                        for op in operators
+                    ]
                 )
             )
-            # Filter out instructions that have already been seen
-            novel_instructions = [
-                mi for mi in mutated_instructions_batch if mi.text not in self._seen_instructions
-            ]
-            mutated_instructions.extend(novel_instructions)
+            # Filter out seen instructions and add novel ones to this generation's offspring candidates
+            novel_instructions = {
+                mi.text: mi
+                for mi in mutated_instructions_from_batch
+                if mi.text not in self._seen_instructions and mi.text not in mutated_instructions
+            }
+            mutated_instructions.update(novel_instructions)
+            # Stop if we've reached the desired number of offspring
             if len(mutated_instructions) >= self.hparams.n_offspring_per_generation:
                 break
-        # Prune to desired number of offspring
-        mutated_instructions = mutated_instructions[: self.hparams.n_offspring_per_generation]
-        # Add these new instructions to registry of seen instructions
-        for mutated_instruction in mutated_instructions:
-            self._seen_instructions[mutated_instruction.text] = mutated_instruction
-        return mutated_instructions
+        # Prune candidates to desired number of offspring
+        offspring = list(mutated_instructions.values())[: self.hparams.n_offspring_per_generation]
+        # Add these offspring to registry of seen instructions
+        for mi in offspring:
+            self._seen_instructions[mi.text] = mi
+        return offspring
 
     def _process_eval_results(
         self, eval_results: InstructionToRolloutResults
     ) -> tuple[GenerationResult, list[str]]:
         """Process eval results and return generation result object and survivors list."""
-        instruction_results: list[InstructionResult] = []
-        # Calculate mean performance scores across each instruction's rollout results
-        for instruction_str, rollout_results in eval_results.items():
-            mean_performance_score = mean(rollout_result.score for rollout_result in rollout_results)
-            instruction_results.append(
-                InstructionResult(
-                    instruction=self._seen_instructions[instruction_str],
-                    mean_performance_score=mean_performance_score,
-                    is_survivor=False,
-                    rollout_results=rollout_results,
-                )
+        # Score each instruction (fitness = bad performance, so sort ascending)
+        scored = [
+            (instr_str, rollout_results, mean(rr.score for rr in rollout_results))
+            for instr_str, rollout_results in eval_results.items()
+        ]
+        scored.sort(key=lambda t: t[2])
+        # Identify survivors
+        n_survivors = self.hparams.n_survivors_per_generation
+        survivors = [scored[i][0] for i in range(n_survivors)]
+        survivor_set = set(survivors)
+        instruction_results = tuple(
+            InstructionResult(
+                instruction=self._seen_instructions[instr_str],
+                mean_performance_score=score,
+                is_survivor=instr_str in survivor_set,
+                rollout_results=tuple(rollout_results),
             )
-        # Identify top survivors (fitness = bad performance)
-        instruction_results.sort(key=lambda x: x.mean_performance_score)
-        survivors: list[str] = []
-        for instruction_result in instruction_results[: self.hparams.n_survivors_per_generation]:
-            instruction_result.is_survivor = True
-            survivors.append(instruction_result.instruction.text)
-        # Calculate mean performance score across all instructions and return generation result
+            for instr_str, rollout_results, score in scored
+        )
+        # Calculate mean performance score across all instructions & return generation result
         mean_performance_score = mean(ier.mean_performance_score for ier in instruction_results)
         return (
             GenerationResult(
@@ -158,28 +185,41 @@ class PerturbationAUC:
             survivors,
         )
 
-    def run_incrementally(self) -> Iterator[PerturbationAUCResult]:
+    async def run_incrementally(self) -> AsyncIterator[PerturbationAUCResult]:
         """Run generation by generation, yielding result up to current point."""
         cur_survivors = [self.instruction]
         generation_results: list[GenerationResult] = []
         for _ in range(self.hparams.n_generations):
-            # Get mutated instructions
-            mutated_instructions = asyncio.run(self._get_mutated_instructions(cur_survivors))
-            # Run + process evals
+            # Get mutated instructions offspring for this generation
+            mutated_instructions = await self._get_mutated_offspring(cur_survivors)
+            # Run + process their evals, deriving a fresh seed for each eval job
             eval_job = EvalJob(
                 instructions=[mi.text for mi in mutated_instructions],
                 n_rollouts_per_instruction=self.hparams.n_rollouts_per_instruction,
+                seed=self._next_derived_seed(),
             )
-            generation_result, cur_survivors = self._process_eval_results(self.eval_runner(eval_job))
+            eval_results = await self.eval_runner(eval_job)
+            generation_result, cur_survivors = self._process_eval_results(eval_results)
             generation_results.append(generation_result)
             # Yield result thus far
             yield PerturbationAUCResult(
                 perturbation_auc=mean(gr.mean_performance_score for gr in generation_results),
-                generations=generation_results,
+                generations=tuple(generation_results),
             )
 
-    def run(self) -> PerturbationAUCResult:
-        """Run PerturbationAUC and return final result."""
-        for results in self.run_incrementally():
-            pass
-        return results
+    async def run(self) -> PerturbationAUCResult:
+        """Run PerturbationAUC and return final result.
+
+        Designed to be `asyncio.gather`-able across many `PerturbationAUC` instances so the
+        user's `EvalRunner`s (and/or LLM-backed mutation operators) can pool/batch work
+        across tasks behind the scenes.
+        """
+        result: PerturbationAUCResult | None = None
+        async for r in self.run_incrementally():
+            result = r
+        assert result is not None, "n_generations must be >= 1"
+        return result
+
+    def run_sync(self) -> PerturbationAUCResult:
+        """Convenience wrapper for single-task scripts; spins up its own event loop."""
+        return asyncio.run(self.run())

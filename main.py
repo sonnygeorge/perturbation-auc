@@ -1,3 +1,4 @@
+import asyncio
 import random
 import string
 
@@ -8,6 +9,7 @@ from perturbation_auc.schema import (
     MutatedInstruction,
     MutationOperator,
     PerturbationAUCHyperParams,
+    PerturbationAUCResult,
     RolloutResult,
 )
 
@@ -115,13 +117,17 @@ LIBERO_TASK_INSTRUCTIONS = [
 ]
 
 
-def mock_eval_runner(eval_job: EvalJob) -> InstructionToRolloutResults:
-    """Assign random scores to each hypothetical rollout for each instruction."""
+async def mock_eval_runner(eval_job: EvalJob) -> InstructionToRolloutResults:
+    """Assign random scores to each hypothetical rollout for each instruction. Honors
+    `eval_job.seed` by drawing all scores from a single seeded RNG (iteration order over
+    `eval_job.instructions` is deterministic). Falls back to the global RNG when no seed
+    was provided."""
+    rng = random.Random(eval_job.seed) if eval_job.seed is not None else random
     instruction_to_rollout_results: InstructionToRolloutResults = {}
     for instruction in eval_job.instructions:
-        instruction_to_rollout_results[instruction] = []
-        for _ in range(eval_job.n_rollouts_per_instruction):
-            instruction_to_rollout_results[instruction].append(RolloutResult(score=random.random()))
+        instruction_to_rollout_results[instruction] = [
+            RolloutResult(score=rng.random()) for _ in range(eval_job.n_rollouts_per_instruction)
+        ]
     return instruction_to_rollout_results
 
 
@@ -130,51 +136,67 @@ class MockMutationOperator(MutationOperator):
 
     n_parents_needed = 1
 
-    async def run(self, parents: list[str]) -> list[MutatedInstruction]:
+    async def run(
+        self, parents: tuple[str, ...], seed: int | None = None
+    ) -> list[MutatedInstruction]:
+        rng = random.Random(seed) if seed is not None else random
         parent_inst = parents[0]
-        idx = random.randint(0, len(parent_inst) - 1)
-        char = random.choice(string.ascii_letters)
+        idx = rng.randint(0, len(parent_inst) - 1)
+        char = rng.choice(string.ascii_letters)
         mutated_inst_text = parent_inst[:idx] + char + parent_inst[idx + 1 :]
         return [MutatedInstruction(text=mutated_inst_text, parents=parents)]
 
 
-if __name__ == "__main__":
-    perturbation_auc = PerturbationAUC(
-        instruction=LIBERO_TASK_INSTRUCTIONS[0],
-        eval_runner=mock_eval_runner,
-        mutation_operators=[MockMutationOperator()],
-        hyper_params=PerturbationAUCHyperParams(
-            n_generations=4,
-            n_offspring_per_generation=3,
-            n_survivors_per_generation=2,
-            n_rollouts_per_instruction=4,
-        ),
-    )
-    for perturbation_auc_result in perturbation_auc.run_incrementally():
-        r = perturbation_auc_result
-        out = [
-            "PerturbationAUCResult(",
-            f"  perturbation_auc={r.perturbation_auc!r},",
-            "  generations=[",
+def _stringify_pauc_result(r: PerturbationAUCResult) -> str:
+    out = [
+        "PerturbationAUCResult(",
+        f"  perturbation_auc={r.perturbation_auc!r},",
+        "  generations=[",
+    ]
+    for gr in r.generations:
+        out += [
+            "    GenerationResult(",
+            "      instructions=[",
         ]
-        for gr in r.generations:
+        for ier in gr.instruction_results:
             out += [
-                "    GenerationResult(",
-                "      instructions=[",
+                "        InstructionEvalResult(",
+                f"          instruction={ier.instruction.text!r},",
+                f"          mean_performance_score={ier.mean_performance_score:.2f},",
+                f"          is_survivor={ier.is_survivor!r},",
+                "          rollout_results=[...],",
+                "        ),",
             ]
-            for ier in gr.instruction_results:
-                out += [
-                    "        InstructionEvalResult(",
-                    f"          instruction={ier.instruction.text!r},",
-                    f"          mean_performance_score={ier.mean_performance_score:.2f},",
-                    f"          is_survivor={ier.is_survivor!r},",
-                    "          rollout_results=[...],",
-                    "        ),",
-                ]
-            out += [
-                "      ],",
-                f"      mean_performance_score={gr.mean_performance_score:.2f},",
-                "    ),",
-            ]
-        out += ["  ],", ")"]
-        print("\n".join(out))
+        out += [
+            "      ],",
+            f"      mean_performance_score={gr.mean_performance_score:.2f},",
+            "    ),",
+        ]
+    out += ["  ],", ")"]
+    return "\n".join(out)
+
+
+async def _amain() -> None:
+    # Cross-task concurrency: gather many PerturbationAUC.run()s at once.
+    paucs = [
+        PerturbationAUC(
+            instruction=instruction,
+            eval_runner=mock_eval_runner,
+            mutation_operators=[MockMutationOperator()],
+            hyper_params=PerturbationAUCHyperParams(
+                n_generations=4,
+                n_offspring_per_generation=3,
+                n_survivors_per_generation=2,
+                n_rollouts_per_instruction=4,
+                seed=42,
+            ),
+        )
+        for instruction in LIBERO_TASK_INSTRUCTIONS[:1]  # Number of tasks to run concurrently
+    ]
+    results = await asyncio.gather(*[pauc.run() for pauc in paucs])
+    for r in results:
+        print(_stringify_pauc_result(r))
+
+
+if __name__ == "__main__":
+    asyncio.run(_amain())
