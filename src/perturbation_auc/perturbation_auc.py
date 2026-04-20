@@ -135,6 +135,7 @@ class PerturbationAUC:
                     ]
                 )
             )
+            # TODO: Batch-factuality-critique the mutated instructions then filter out the false cases?
             # Filter out seen instructions and add novel ones to this generation's offspring candidates
             novel_instructions = {
                 mi.text: mi

@@ -1,4 +1,2 @@
 Original: {{ original }}
 Perturbed: {{ perturbed }}
-
-Given the above, would the outcome produced by successfully completing the "perturbed" instruction satisfy the terminal-state success condition likely used for evaluating the "original" instruction? (yes / no / ambiguous)
